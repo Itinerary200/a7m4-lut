@@ -32,6 +32,8 @@ ACCURACY_DEFAULT = "标准(约 20 秒)"
 # 输出:普通显示画面,还是编码成 SLog3(相机拍出来是 log,后期能直接套 SLog3 LUT)
 OUTPUTS: dict[str, str] = {"普通显示(Rec709)": "display", "SLog3(log 输出)": "slog3"}
 OUTPUT_DEFAULT = "普通显示(Rec709)"
+SLOG3_MIN_SAMPLES = 12288
+SLOG3_MIN_TABLE_STEPS = 240
 ACCURACY_NOTE = {
     "快速(约 10 秒)": "最快,颜色靠近但不追细节",
     "标准(约 20 秒)": "日常够用,推荐",
@@ -395,6 +397,9 @@ class App(tk.Tk):
         self.samples_var = tk.StringVar(value=str(SAMPLES_DEFAULT))
         self.accuracy_var = tk.StringVar(value=ACCURACY_DEFAULT)
         self.output_var = tk.StringVar(value=OUTPUT_DEFAULT)
+        self._display_samples = str(SAMPLES_DEFAULT)
+        self._display_table = str(TABLE_STEPS_DEFAULT)
+        self._log_mode = False
         self.status_var = tk.StringVar(value="选好 LUT 文件后点「开始转换」")
         self.theme_var = tk.StringVar(value=theme_label)
 
@@ -658,6 +663,7 @@ class App(tk.Tk):
             font=looktheme.FONT,
         )
         self.output_box.grid(row=4, column=1, columnspan=3, sticky="w", pady=3)
+        self.output_var.trace_add("write", self._on_output_change)
 
         label(5, "保存到")
         out_row = ttk.Frame(settings)
@@ -859,6 +865,33 @@ class App(tk.Tk):
         if cube.exists():
             self._current_cube = cube
             self._schedule_preview()
+
+    def _on_output_change(self, *_args: object) -> None:
+        """输出切到 S-Log3 时,采样数与最后修正自动抬高;切回普通显示时还原原值。"""
+        want_log = OUTPUTS.get(self.output_var.get(), "display") == "slog3"
+        if want_log and not self._log_mode:
+            self._display_samples = self.samples_var.get() or str(SAMPLES_DEFAULT)
+            self._display_table = self.table_var.get() or str(TABLE_STEPS_DEFAULT)
+            try:
+                samples = int(self._display_samples)
+            except ValueError:
+                samples = SAMPLES_DEFAULT
+            try:
+                table = int(self._display_table)
+            except ValueError:
+                table = TABLE_STEPS_DEFAULT
+            self.samples_var.set(str(max(samples, SLOG3_MIN_SAMPLES)))
+            self.table_var.set(str(max(table, SLOG3_MIN_TABLE_STEPS)))
+            self._log_mode = True
+            self.status_var.set(
+                f"S-Log3 输出:采样数已抬到 {SLOG3_MIN_SAMPLES}、"
+                f"最后修正 {SLOG3_MIN_TABLE_STEPS},暗部才压得住"
+            )
+        elif not want_log and self._log_mode:
+            self.samples_var.set(self._display_samples)
+            self.table_var.set(self._display_table)
+            self._log_mode = False
+            self.status_var.set("选好 LUT 文件后点「开始转换」")
 
     def _on_accuracy(self, _event: tk.Event[Any]) -> None:
         self.accuracy_note.configure(text=ACCURACY_NOTE.get(self.accuracy_var.get(), ""))
