@@ -1,0 +1,83 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "a7m4-lut"
+version = "1.2.10"
+description = "把 .cube LUT 转成索尼 A7M4 机内创意外观(camera-look v2 JSON),也支持输出 S-Log3"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "A7M4 LUT Converter contributors" }]
+keywords = ["cube", "lut", "sony", "a7m4", "camera-look", "s-log3", "color"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Environment :: Console",
+  "Environment :: Win32 (MS Windows)",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Multimedia :: Graphics",
+]
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+# 完整拟合/界面所需(界面还要 ttkbootstrap + pillow)
+m4 = ["torch", "ttkbootstrap", "pillow"]
+# A7R V 侧训练引擎所需
+engine = ["scipy", "tifffile", "threadpoolctl"]
+dev = ["pytest", "ruff", "mypy", "numpy"]
+
+[project.scripts]
+r5lut = "r5lut.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.package-data]
+r5lut = ["assets/*.png", "assets/*.ico", "assets/native16/*.npy"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["r5lut*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E", "F", "W",   # pycodestyle / pyflakes
+  "I",             # isort
+  "N",             # pep8-naming
+  "UP",            # pyupgrade
+  "B",             # bugbear
+  "C4",            # comprehensions
+  "SIM",           # simplify
+  "RET",           # return rules
+  "PERF",          # performance
+  "PTH",           # pathlib
+  "T20",           # print 只在 cli/gui 允许
+]
+ignore = ["N802", "N803", "N806"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/r5lut/cli.py" = ["T20"]
+"src/r5lut/gui.py" = ["T20"]
+"tests/*" = ["T20"]
+"tools/*" = ["T20"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unused_configs = true
+disallow_any_generics = true
+no_implicit_reexport = true
+files = ["src/r5lut"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["error::DeprecationWarning:r5lut.*"]

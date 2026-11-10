@@ -1,0 +1,5 @@
+﻿# A7M4 cube→JSON 所需依赖(与 R5 训练分开,后者见 engine/requirements.txt)
+torch>=2.5
+numpy>=2.0
+scipy>=1.15
+rawpy>=0.19

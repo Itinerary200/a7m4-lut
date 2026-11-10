@@ -1,0 +1,6 @@
+__pycache__/
+runs/
+batches/
+chart_uploads/
+previews/
+*.log

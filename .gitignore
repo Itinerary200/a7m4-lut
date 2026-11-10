@@ -1,0 +1,62 @@
+# 忽略列表：仓库只放源码与文档，产物/资产/虚拟环境都不进 git
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# 构建与产物
+build/
+dist/
+out/
+backups/
+artifacts/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 测试与工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 训练资产（版权归索尼，不随仓库分发）
+/assets/
+/models/
+/charts/
+
+# 打包与临时文件
+*.zip
+*.7z
+*.log
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 本地配置
+.env
+.env.*
+*.local
+
+# 但界面用到的图标与文档配图要保留
+!src/r5lut/assets/*.png
+!src/r5lut/assets/*.ico
+!docs/images/*.png
+!src/r5lut/assets/native16/*.npy
+
+# 代理/协作工具自身文件,不属于本项目
+.agents/
+skills-lock.json
+
+# 引擎的测量数据与抓包(体积大、含相机采集原始数据),只提交引擎代码
+engine/data/
+engine/web/data/
+
+# 示例固件包(体积大且与 A7M4 无关)
+samples/
