@@ -44,6 +44,15 @@ CHART_WIDTH = 320
 CHART_HEIGHT = 180
 SWATCH_HEIGHT = 34
 
+# 预览里「相机查表」这步只在缩略尺寸上算:整张照片(几千万像素)直接查 129³ 表
+# 会瞬间吃掉几个 GB,以前就是这么把预览弄挂的。取等效 800x375 左右,放大由画布做。
+CAMERA_MAX_PIXELS = 300_000
+CAMERA_CHUNK = 65_536
+# 用户自己载入的图先缩到这个宽度再进预览,原图另存不参与渲染。
+IMAGE_MAX_WIDTH = 1600
+# 两张预览图各自的高度上限:竖图/长图不能把下面的开关和按钮挤出卡片。
+PREVIEW_CANVAS_MAX = 220
+
 
 def convert_one(
     cube: Path,
@@ -293,6 +302,33 @@ def _safe_name(text: str, fallback: str = "Look") -> str:
     return cleaned.rstrip() or fallback
 
 
+def _decode_image(data: bytes) -> preview.Raster:
+    """优先用 Pillow(快,支持 JPG/PNG,顺手缩到 1600 宽),没有就退回纯 Python 解码。
+
+    纯 Python 解码一张 1200 万像素的 PNG 要 6 秒以上,界面会卡住,所以能借力就借力。
+    """
+    try:
+        import io
+
+        from PIL import Image
+    except Exception:  # noqa: BLE001 - 没有 Pillow 只是慢一点
+        return preview.decode_png(data)
+    with Image.open(io.BytesIO(data)) as img:
+        frame = img.convert("RGB")
+        if frame.width > IMAGE_MAX_WIDTH:
+            ratio = IMAGE_MAX_WIDTH / frame.width
+            size = (IMAGE_MAX_WIDTH, max(1, round(frame.height * ratio)))
+            frame = frame.resize(size, Image.LANCZOS)
+        return preview.Raster(frame.width, frame.height, bytearray(frame.tobytes()))
+
+
+def _use_image_text(active: bool) -> str:
+    """开关文案把当前状态写清楚,不靠那个小方块去猜。"""
+    if active:
+        return "预览用我的图(点一下换回色卡)"
+    return "预览用内置色卡(点一下用我的图)"
+
+
 def _hex(colour: tuple[int, int, int]) -> str:
     return "#{:02x}{:02x}{:02x}".format(*colour)
 
@@ -355,6 +391,8 @@ class App(tk.Tk):
         self._camera: tuple[Path, Any, Any, str] | None = None
         self._camera_cache: tuple[str, Any] | None = None
         self._source_image: preview.Raster | None = None
+        self.use_image_var = tk.BooleanVar(value=True)
+        self._camera_failed = False
         self._probe: tuple[preview.Raster, float, int, int] | None = None
         self._preview_job: str | None = None
         self._history: list[str] = []
@@ -685,7 +723,7 @@ class App(tk.Tk):
         card.pack(fill="both", expand=True)
         card.columnconfigure(0, weight=1)
         card.rowconfigure(4, weight=0)
-        card.rowconfigure(6, weight=1)
+        card.rowconfigure(7, weight=1)
 
         ttk.Label(card, text="原图").grid(row=0, column=0, sticky="w", pady=(0, 2))
         self.before_canvas = tk.Canvas(card, height=150, background="#ffffff", highlightthickness=0)
@@ -716,11 +754,19 @@ class App(tk.Tk):
         )
         self.preview_status.pack(side="left", fill="x", expand=True)
 
+        self.use_image_box = ttk.Checkbutton(
+            card,
+            text=_use_image_text(True),
+            variable=self.use_image_var,
+            command=self._on_use_image,
+        )
+        self.use_image_box.grid(row=6, column=0, sticky="w", pady=(4, 0))
+
         spacer = ttk.Frame(card, height=6)
-        spacer.grid(row=6, column=0, sticky="nsew")
+        spacer.grid(row=7, column=0, sticky="nsew")
 
         buttons = ttk.Frame(card)
-        buttons.grid(row=7, column=0, sticky="ew")
+        buttons.grid(row=8, column=0, sticky="ew")
         self.theme.button(buttons, "载入图…", self._load_image).pack(side="left", padx=(0, 6))
         self.theme.button(buttons, "保存预览", self._save_preview).pack(side="left", padx=(0, 6))
         self.theme.button(buttons, "刷新", self._refresh_preview).pack(side="left")
@@ -1122,7 +1168,11 @@ class App(tk.Tk):
         return self._camera[1], self._camera[2], self._camera[3]
 
     def _camera_raster(self, raster: preview.Raster) -> preview.Raster | None:
-        """按相机实际做法(129³ 表 + 三线性)重画整张图;结果缓存,拖窗口不重算。"""
+        """按相机实际做法(129³ 表 + 三线性)重画整张图。
+
+        只在缩略尺寸上算(CAMERA_MAX_PIXELS),再分块渲染:整张照片直接查表会
+        吃掉几个 GB 内存,以前正是这样在批量转换时把预览弄没的。
+        """
         state = self._camera_state()
         if state is None:
             return None
@@ -1131,14 +1181,29 @@ class App(tk.Tk):
         from . import m4fit
 
         model, grid, _transfer = state
-        key = f"{id(grid)}:{raster.width}x{raster.height}"
+        pixels_total = max(1, raster.width * raster.height)
+        scale = min(1.0, (CAMERA_MAX_PIXELS / pixels_total) ** 0.5)
+        small = raster if scale > 0.999 else _zoom(raster, scale)
+        key = f"{id(grid)}:{small.width}x{small.height}"
         if self._camera_cache is not None and self._camera_cache[0] == key:
             cached = self._camera_cache[1]
             return cached if isinstance(cached, preview.Raster) else None
-        coords = np.asarray(raster.pixels, dtype=np.float64).reshape(-1, 3)
-        rendered = m4fit.camera_render(model, coords, grid)
+        coords = np.asarray(small.pixels, dtype=np.float64).reshape(-1, 3)
+        rendered = np.empty_like(coords)
+        try:
+            for start in range(0, len(coords), CAMERA_CHUNK):
+                block = coords[start : start + CAMERA_CHUNK]
+                rendered[start : start + len(block)] = m4fit.camera_render(model, block, grid)
+        except BaseException as exc:  # noqa: BLE001 - 预览算不动就退回 LUT 直算
+            if not self._camera_failed:
+                self._camera_failed = True
+                self.preview_status.configure(
+                    text=f"相机查表没算动({type(exc).__name__}),先按 LUT 直算显示"
+                )
+            return None
+        self._camera_failed = False
         pixels = bytearray(np.clip(np.rint(rendered), 0, 255).astype(np.uint8).tobytes())
-        out = preview.Raster(raster.width, raster.height, pixels)
+        out = preview.Raster(small.width, small.height, pixels)
         self._camera_cache = (key, out)
         return out
 
@@ -1171,7 +1236,7 @@ class App(tk.Tk):
             self.chip.configure(background="#ffffff")
             self.preview_status.configure(text="点图上任意位置看转换结果")
             return
-        chart = self._source_image or preview.test_chart()
+        chart = self._chart()
         painted = self._camera_raster(chart)
         if painted is None:
             painted = preview.apply_cube(cube, chart, self._transfer_of(cube))
@@ -1185,17 +1250,18 @@ class App(tk.Tk):
     def _paint(
         self, canvas: tk.Canvas, raster: preview.Raster
     ) -> tuple[preview.Raster, float, int, int]:
-        """按画布宽度铺满(该放大就放大),跟参考界面一样不留左右白边。"""
+        """铺满画布宽度(该放大就放大),但高度有上限,免得把下面的按钮挤出去。"""
         width = max(1, canvas.winfo_width())
-        scale = width / max(1, raster.width)
+        scale = min(width / max(1, raster.width), PREVIEW_CANVAS_MAX / max(1, raster.height))
         shown = _zoom(raster, scale)
         if abs(canvas.winfo_height() - shown.height) > 1:
             canvas.configure(height=shown.height)
+        left = max(0, (width - shown.width) // 2)
         photo = tk.PhotoImage(data=base64.b64encode(preview.encode_png(shown)).decode("ascii"))
         canvas.delete("all")
-        canvas.create_image(0, 0, image=photo, anchor="nw")
+        canvas.create_image(left, 0, image=photo, anchor="nw")
         canvas.image = photo  # type: ignore[attr-defined]
-        return raster, scale, 0, 0
+        return raster, scale, left, 0
 
     def _paint_swatches(self, cube: preview.Cube) -> None:
         self._swatch_cube = cube
@@ -1278,14 +1344,25 @@ class App(tk.Tk):
         )
 
     def _load_image(self) -> None:
-        picked = filedialog.askopenfilename(title="选择一张 PNG", filetypes=[("PNG", "*.png")])
+        picked = filedialog.askopenfilename(
+            title="选一张图片",
+            filetypes=[("图片", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff"), ("所有文件", "*.*")],
+        )
         if not picked:
             return
         try:
-            self._source_image = preview.decode_png(Path(picked).read_bytes())
+            raster = _decode_image(Path(picked).read_bytes())
         except BaseException as exc:  # noqa: BLE001 - 解码失败要告知
             messagebox.showerror("这张图读不了", f"{type(exc).__name__}: {exc}")
             return
+        if raster.width > IMAGE_MAX_WIDTH:
+            raster = _zoom(raster, IMAGE_MAX_WIDTH / raster.width)
+        self._source_image = raster
+        self.use_image_var.set(True)
+        self._camera_cache = None
+        self.status_var.set(
+            f"预览改用你自己的图:{Path(picked).name}({raster.width}×{raster.height})"
+        )
         self._schedule_preview()
 
     def _save_preview(self) -> None:
@@ -1298,13 +1375,32 @@ class App(tk.Tk):
         )
         if not target:
             return
-        sheet = preview.compose_sheet(cube, source=self._source_image)
+        own = self._source_image if self.use_image_var.get() else None
+        sheet = preview.compose_sheet(cube, source=own)
         Path(target).write_bytes(preview.encode_png(sheet))
         self.status_var.set(f"预览已保存:{target}")
 
     def _refresh_preview(self) -> None:
+        """卸掉自己载入的图,回到内置色卡。"""
         self._source_image = None
+        self.use_image_var.set(True)
+        self._camera_cache = None
+        self.status_var.set("预览回到内置色卡")
         self._schedule_preview()
+
+    def _on_use_image(self) -> None:
+        active = bool(self.use_image_var.get())
+        self._camera_cache = None
+        self.use_image_box.configure(text=_use_image_text(active))
+        if self._source_image is not None:
+            self.status_var.set("预览用你载入的图" if active else "预览暂时用内置色卡(图还留着)")
+        self._schedule_preview()
+
+    def _chart(self) -> preview.Raster:
+        """当前预览该用哪张输入图:自己的图(开关打开时)或内置色卡。"""
+        if self.use_image_var.get() and self._source_image is not None:
+            return self._source_image
+        return preview.test_chart()
 
 
 def run() -> int:
