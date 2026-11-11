@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Any, cast
 
-from . import __version__, core
+from . import __version__, core, transfer
 
 
 def _utf8() -> None:
@@ -76,8 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
     m4.add_argument(
         "--transfer",
         default="auto",
-        choices=["auto", "display", "slog3"],
-        help="LUT 输入域:auto 自动识别(默认),display 显示域,slog3 索尼 S-Log3",
+        choices=["auto", "display", *transfer.formats()],
+        help="LUT 输入域:auto 自动识别(默认),display 显示域,其余为各家 log 曲线",
     )
     m4.add_argument(
         "--table-steps",

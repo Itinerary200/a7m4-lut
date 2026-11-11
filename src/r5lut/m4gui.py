@@ -75,6 +75,8 @@ def convert_one(
     from . import m4fit, m4json
 
     out.mkdir(parents=True, exist_ok=True)
+    # 文件名尾部的空格/点在 Windows 上会被吃掉,导致建目录失败 —— 统一清掉
+    name = name.strip(" .") or cube.stem.strip(" .") or "look"
     assets = m4fit.resolve_assets(assets)
     log(f"读取 LUT:{cube.name}")
     baked = preview.load_cube(cube)
@@ -82,19 +84,41 @@ def convert_one(
 
     if input_transfer == "auto":
         input_transfer = transfer_mod.detect(baked, cube.name)
-    if input_transfer == transfer_mod.SLOG3:
-        log("这是 SLog3 输入的 LUT,先把画面换算成 log 域再查表")
+    output_kind = transfer_mod.detect_output(baked, cube.name)
+    # 优先用 LUT 自身反解出来的曲线:各家的固件版本会微调,关键词查表有时不准。
+    calibrated, residual = transfer_mod.solve(baked, output_kind)
+    curve: str | Any = input_transfer
+    if calibrated is not None:
+        log(f"另外反解出 LUT 自己的输入曲线(残差 {residual:.4f}),关键词曲线不准时改用它")
+    elif input_transfer != transfer_mod.DISPLAY:
+        log(f"这个 LUT 的输入是 {transfer_mod.label(input_transfer)},先把画面换算成 log 域再查表")
     front, split, _design = m4fit.load_front(assets)
     model = m4fit.Model(assets)
     native_path = native or (str(m4fit.bundled_native16()) if m4fit.bundled_native16() else "")
     from perceptual import de2000, to_lab
 
     mask = split == "test"
+    # 评分只看抽样的测试点:整张图逐点算 129³ 查表要几十秒,抽样 2 万点结论一样。
+    points = np.flatnonzero(mask)
+    stride = max(1, points.size // 20000)
+    eval_ids = points[::stride]
+
+    # 曲线候选:先按名字/关键词查到的曲线;如果这一版调不出精度,再试「从 LUT 自己反解出来的曲线」。
+    # 注意反解曲线会把 LUT 的对比度一起吃进去,所以只在关键词曲线不够准的时候才用。
+    curve_cell: list[Any] = [curve]
+    candidates: list[tuple[str, Any]] = [(str(input_transfer), curve)]
+    if calibrated is not None and calibrated is not curve:
+        candidates.append((transfer_mod.curve_label(calibrated), calibrated))
+
+    if native_path:
+        log("使用相机原始色彩数据(精度准确口径)")
+    else:
+        log("没有相机数据,改用估算口径(结果会偏乐观)")
 
     def attempt(tag: str, path: str | None) -> tuple[Any, Any, Any, Any, float, float] | None:
         """用某个起点拟合一次,返回 (base, grid, audit, target, de00, mae8)。"""
         base = model.native_base(np.load(path)) if path else model.render(front, None)
-        target = m4fit.cube_target(base, baked, input_transfer)
+        target = m4fit.cube_target(base, baked, curve_cell[0], output_kind)
         grid, audit = m4fit.fit(
             assets,
             target,
@@ -104,71 +128,103 @@ def convert_one(
             base=base,
             stratified=False,
         )
-        candidate = np.asarray(m4fit.TablePath(model, base).outputs(grid).detach().cpu().numpy())
-        left = np.clip(candidate[mask], 0, 255)
-        right = np.clip(np.asarray(target)[mask], 0, 255)
+        sub_base = np.array(base, copy=True)[eval_ids]
+        candidate = np.asarray(
+            m4fit.TablePath(model, sub_base).outputs(grid).detach().cpu().numpy()
+        )
+        left = np.clip(candidate, 0, 255)
+        right = np.clip(np.asarray(target)[eval_ids], 0, 255)
         score = float(de2000(to_lab(left), to_lab(right)).mean())
         return base, grid, audit, target, score, float(np.abs(left - right).mean())
 
-    if native_path:
-        log("使用相机原始色彩数据(精度准确口径)")
-    else:
-        log("没有相机数据,改用估算口径(结果会偏乐观)")
-    log("正在计算颜色对应关系…")
-
-    order: list[tuple[str, str | None]] = []
-    if native:
-        order.append(("指定起点", native))
-    else:
-        # 先量一下这份 LUT 有多"没颜色":黑白 LUT 用中性起点根本拟合不出来
-        # (残差就是整块去色),直接用黑白胶片起点,一次就能到位。
-        probe_base = (
-            model.native_base(np.load(native_path)) if native_path else model.render(front, None)
-        )
-        probe_target = m4fit.cube_target(probe_base, baked, input_transfer)
-        chroma = float(np.abs(probe_target.max(axis=1) - probe_target.min(axis=1)).mean())
-        if chroma < 8.0:
-            order.append(("acros", str(m4fit.bundled_native16("acros") or "")))
-        order.append(("anchor", native_path))
-        for tag in ("ricoh-positive", "ricoh-negative", "acros"):
-            found = m4fit.bundled_native16(tag)
-            if found is not None:
-                order.append((tag, str(found)))
-
-    base: Any = None
     grid: Any = None
     audit: Any = None
-    target: Any = None
     de00 = float("inf")
     mae8 = 0.0
     seed_tag = "anchor"
-    for tag, candidate_path in order:
-        if base is not None:
-            log(f"换个相机起点再试一次({tag})…")
-        current = attempt(tag, candidate_path or None)
-        if current is None:
+    used_curve = str(input_transfer)
+
+    for curve_name, curve_value in candidates:
+        curve_cell[0] = curve_value
+        log(
+            "正在计算颜色对应关系…"
+            if curve_value is curve
+            else f"换成自校准曲线再算一遍({curve_name})…"
+        )
+
+        order: list[tuple[str, str | None]] = []
+        if native:
+            order.append(("指定起点", native))
+        else:
+            # 先量一下这份 LUT 有多"没颜色":黑白 LUT 用中性起点根本拟合不出来
+            # (残差就是整块去色),直接用黑白胶片起点,一次就能到位。
+            probe_base = (
+                model.native_base(np.load(native_path))
+                if native_path
+                else model.render(front, None)
+            )
+            probe_target = m4fit.cube_target(probe_base, baked, curve_value, output_kind)
+            chroma = float(np.abs(probe_target.max(axis=1) - probe_target.min(axis=1)).mean())
+            if chroma < 8.0:
+                order.append(("acros", str(m4fit.bundled_native16("acros") or "")))
+            order.append(("anchor", native_path))
+            for tag in ("ricoh-positive", "ricoh-negative", "acros"):
+                found = m4fit.bundled_native16(tag)
+                if found is not None:
+                    order.append((tag, str(found)))
+
+        trial_base: Any = None
+        trial_grid: Any = None
+        trial_audit: Any = None
+        trial_target: Any = None
+        trial_de00 = float("inf")
+        trial_mae8 = 0.0
+        trial_seed = "anchor"
+
+        for tag, candidate_path in order:
+            if trial_base is not None:
+                log(f"换个相机起点再试一次({tag})…")
+            current = attempt(tag, candidate_path or None)
+            if current is None:
+                continue
+            if current[4] + 0.15 < trial_de00:
+                trial_base, trial_grid, trial_audit, trial_target, trial_de00, trial_mae8 = current
+                trial_seed = tag
+            if trial_de00 < 2.5:
+                break
+
+        if trial_base is None:
             continue
-        if current[4] + 0.15 < de00:
-            base, grid, audit, target, de00, mae8 = current
-            seed_tag = tag
+
+        if table_steps:
+            log("按相机实际处理方式再校正一次…")
+            refiner = m4fit.TableFit(model, trial_base, trial_target, samples=samples)
+            trial_grid, _ = refiner.refine(trial_grid, steps=table_steps)
+
+        sub_base = np.array(trial_base, copy=True)[eval_ids]
+        pred = np.asarray(
+            m4fit.TablePath(model, sub_base).outputs(trial_grid).detach().cpu().numpy()
+        )
+        a = np.clip(pred, 0, 255)
+        b = np.clip(np.asarray(trial_target)[eval_ids], 0, 255)
+        scored = float(de2000(to_lab(a), to_lab(b)).mean())
+        if scored < de00:
+            grid, audit = trial_grid, trial_audit
+            de00, mae8, seed_tag, used_curve = (
+                scored,
+                float(np.abs(a - b).mean()),
+                trial_seed,
+                curve_name,
+            )
         if de00 < 2.5:
             break
 
-    if table_steps:
-        log("按相机实际处理方式再校正一次…")
-        refiner = m4fit.TableFit(model, base, target, samples=samples)
-        grid, _ = refiner.refine(grid, steps=table_steps)
+    curve_cell[0] = used_curve
     if state is not None:
         state["model"] = model
         state["grid"] = np.array(grid, copy=True)
         state["cube"] = cube
-        state["transfer"] = input_transfer
-    path = m4fit.TablePath(model, base)
-    pred = np.asarray(path.outputs(grid).detach().cpu().numpy())
-    a = np.clip(pred[mask], 0, 255)
-    b = np.clip(np.asarray(target)[mask], 0, 255)
-    de00 = float(de2000(to_lab(a), to_lab(b)).mean())
-    mae8 = float(np.abs(a - b).mean())
+        state["transfer"] = used_curve
 
     seed = m4json.load_seed(assets / "models" / "bridge" / "anchor.json")
     table = [
@@ -184,6 +240,10 @@ def convert_one(
             "cube_size": getattr(baked, "size", None),
             "target_semantics": "cube 作用在中性原生输出上",
             "input_transfer": input_transfer,
+            "input_curve": str(curve)
+            if isinstance(curve, str)
+            else transfer_mod.curve_label(curve),
+            "curve_residual": round(residual, 5),
         },
         "fit": {
             "grid_nonzero": audit["grid_nonzero"],
@@ -318,7 +378,8 @@ def _decode_image(data: bytes) -> preview.Raster:
         if frame.width > IMAGE_MAX_WIDTH:
             ratio = IMAGE_MAX_WIDTH / frame.width
             size = (IMAGE_MAX_WIDTH, max(1, round(frame.height * ratio)))
-            frame = frame.resize(size, Image.LANCZOS)
+            resample: Any = getattr(Image, "Resampling", Image)
+            frame = frame.resize(size, resample.LANCZOS)
         return preview.Raster(frame.width, frame.height, bytearray(frame.tobytes()))
 
 

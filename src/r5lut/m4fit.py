@@ -213,24 +213,35 @@ def cube_target(
     base: np.ndarray,
     cube: Any,
     transfer: str = "display",
+    output: str = "display",
 ) -> np.ndarray:
     """把 .cube 作用在相机基础输出上(0..255 sRGB 观感)。
 
-    transfer="slog3" 时先把显示值换成 SLog3 码值再查表 ——
-    SLog3 型 LUT 的输入本来就是 log 域,直接喂显示值会让画面又灰又淡。
+    transfer 是这份 LUT 的输入编码(索尼 S-Log3、富士 F-Log …),进门先换算成对应码值;
+    output 是它吐出来的编码(有的官方 LUT 目标是 SLog2、PQ、HLG),出门再解码回显示域。
+    两头都按 LUT 作者的本意处理,才谈得上「自动适配」。
     """
     from r5lut import preview
     from r5lut import transfer as transfer_mod
 
     flat = base.reshape(-1, 3) / 255.0
     out = np.empty_like(flat)
-    use_log = transfer == transfer_mod.SLOG3
+    use_in = transfer != transfer_mod.DISPLAY
+    use_out = output != transfer_mod.DISPLAY
     for index, (red, green, blue) in enumerate(flat):
-        if use_log:
-            red = transfer_mod.display_to_slog3(float(red))
-            green = transfer_mod.display_to_slog3(float(green))
-            blue = transfer_mod.display_to_slog3(float(blue))
-        out[index] = preview.sample(cube, float(red), float(green), float(blue))
+        if use_in:
+            red = transfer_mod.display_to_code(float(red), transfer)
+            green = transfer_mod.display_to_code(float(green), transfer)
+            blue = transfer_mod.display_to_code(float(blue), transfer)
+        sampled = preview.sample(cube, float(red), float(green), float(blue))
+        if use_out:
+            out[index] = (
+                transfer_mod.code_to_display(float(sampled[0]), output),
+                transfer_mod.code_to_display(float(sampled[1]), output),
+                transfer_mod.code_to_display(float(sampled[2]), output),
+            )
+        else:
+            out[index] = sampled
     return (np.clip(out, 0.0, 1.0) * 255.0).reshape(base.shape)
 
 
