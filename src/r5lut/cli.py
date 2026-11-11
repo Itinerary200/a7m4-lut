@@ -80,12 +80,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="LUT 输入域:auto 自动识别(默认),display 显示域,slog3 索尼 S-Log3",
     )
     m4.add_argument(
-        "--output",
-        default="display",
-        choices=["display", "slog3"],
-        help="输出域:display 普通显示画面(默认),slog3 编码成 S-Log3(log 输出)",
-    )
-    m4.add_argument(
         "--table-steps",
         type=int,
         default=150,
@@ -268,7 +262,6 @@ def main(argv: list[str] | None = None) -> int:
             lambda message: print(message, file=sys.stderr),
             samples=args.samples,
             input_transfer=args.transfer,
-            output_transfer=args.output,
         )
         print(
             json.dumps(

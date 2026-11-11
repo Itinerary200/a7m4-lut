@@ -29,11 +29,6 @@ ACCURACY: dict[str, int] = {
 }
 ACCURACY_DEFAULT = "标准(约 20 秒)"
 
-# 输出:普通显示画面,还是编码成 SLog3(相机拍出来是 log,后期能直接套 SLog3 LUT)
-OUTPUTS: dict[str, str] = {"普通显示(Rec709)": "display", "SLog3(log 输出)": "slog3"}
-OUTPUT_DEFAULT = "普通显示(Rec709)"
-SLOG3_MIN_SAMPLES = 12288
-SLOG3_MIN_TABLE_STEPS = 240
 ACCURACY_NOTE = {
     "快速(约 10 秒)": "最快,颜色靠近但不追细节",
     "标准(约 20 秒)": "日常够用,推荐",
@@ -50,21 +45,6 @@ CHART_HEIGHT = 180
 SWATCH_HEIGHT = 34
 
 
-def _seen(values: Any, decode: str) -> Any:
-    """把可能是 log 码值的数组解码回显示值,便于比较。"""
-    import numpy as np
-
-    from . import transfer as transfer_mod
-
-    if decode != transfer_mod.SLOG3:
-        return np.asarray(values, dtype=np.float64)
-    array = np.asarray(values, dtype=np.float64)
-    flat = array.reshape(-1)
-    codes = np.array([point[1] for point in transfer_mod.SLOG3_CURVE]) * 255.0
-    shows = np.array([point[0] for point in transfer_mod.SLOG3_CURVE]) * 255.0
-    return np.interp(np.clip(flat, codes[0], codes[-1]), codes, shows).reshape(array.shape)
-
-
 def convert_one(
     cube: Path,
     assets: Path,
@@ -77,7 +57,6 @@ def convert_one(
     samples: int = 8192,
     state: dict[str, Any] | None = None,
     input_transfer: str = "auto",
-    output_transfer: str = "display",
 ) -> dict[str, Any]:
     """单张转换(界面与命令行共用)。state 用来把模型与网格交回界面做预览。"""
     import hashlib
@@ -96,26 +75,17 @@ def convert_one(
         input_transfer = transfer_mod.detect(baked, cube.name)
     if input_transfer == transfer_mod.SLOG3:
         log("这是 SLog3 输入的 LUT,先把画面换算成 log 域再查表")
-    if output_transfer == transfer_mod.SLOG3:
-        log("输出成 SLog3:相机拍出来就是 log 画面,后期可以直接套 SLog3 的 LUT")
     front, split, _design = m4fit.load_front(assets)
     model = m4fit.Model(assets)
     native_path = native or (str(m4fit.bundled_native16()) if m4fit.bundled_native16() else "")
     from perceptual import de2000, to_lab
 
     mask = split == "test"
-    # 输出成 SLog3 时,log 码值在高光处很稀疏:直接在码值空间算误差会放过
-    # 高光的偏差。改成先解码回显示值再比,数字和肉眼看到的一致。
-    decode = transfer_mod.SLOG3 if output_transfer == transfer_mod.SLOG3 else ""
-    if decode:
-        # log 输出解码后暗部会被放大,点多一些、表路径多修几轮才压得住
-        samples = max(samples, 12288)
-        table_steps = max(table_steps, 240)
 
     def attempt(tag: str, path: str | None) -> tuple[Any, Any, Any, Any, float, float] | None:
         """用某个起点拟合一次,返回 (base, grid, audit, target, de00, mae8)。"""
         base = model.native_base(np.load(path)) if path else model.render(front, None)
-        target = m4fit.cube_target(base, baked, input_transfer, output_transfer)
+        target = m4fit.cube_target(base, baked, input_transfer)
         grid, audit = m4fit.fit(
             assets,
             target,
@@ -124,11 +94,10 @@ def convert_one(
             samples=samples,
             base=base,
             stratified=False,
-            decode=decode,
         )
         candidate = np.asarray(m4fit.TablePath(model, base).outputs(grid).detach().cpu().numpy())
-        left = np.clip(_seen(candidate, decode)[mask], 0, 255)
-        right = np.clip(_seen(target, decode)[mask], 0, 255)
+        left = np.clip(candidate[mask], 0, 255)
+        right = np.clip(np.asarray(target)[mask], 0, 255)
         score = float(de2000(to_lab(left), to_lab(right)).mean())
         return base, grid, audit, target, score, float(np.abs(left - right).mean())
 
@@ -147,7 +116,7 @@ def convert_one(
         probe_base = (
             model.native_base(np.load(native_path)) if native_path else model.render(front, None)
         )
-        probe_target = m4fit.cube_target(probe_base, baked, input_transfer, output_transfer)
+        probe_target = m4fit.cube_target(probe_base, baked, input_transfer)
         chroma = float(np.abs(probe_target.max(axis=1) - probe_target.min(axis=1)).mean())
         if chroma < 8.0:
             order.append(("acros", str(m4fit.bundled_native16("acros") or "")))
@@ -178,7 +147,7 @@ def convert_one(
 
     if table_steps:
         log("按相机实际处理方式再校正一次…")
-        refiner = m4fit.TableFit(model, base, target, samples=samples, decode=decode)
+        refiner = m4fit.TableFit(model, base, target, samples=samples)
         grid, _ = refiner.refine(grid, steps=table_steps)
     if state is not None:
         state["model"] = model
@@ -187,8 +156,8 @@ def convert_one(
         state["transfer"] = input_transfer
     path = m4fit.TablePath(model, base)
     pred = np.asarray(path.outputs(grid).detach().cpu().numpy())
-    a = np.clip(_seen(pred, decode)[mask], 0, 255)
-    b = np.clip(_seen(target, decode)[mask], 0, 255)
+    a = np.clip(pred[mask], 0, 255)
+    b = np.clip(np.asarray(target)[mask], 0, 255)
     de00 = float(de2000(to_lab(a), to_lab(b)).mean())
     mae8 = float(np.abs(a - b).mean())
 
@@ -206,7 +175,6 @@ def convert_one(
             "cube_size": getattr(baked, "size", None),
             "target_semantics": "cube 作用在中性原生输出上",
             "input_transfer": input_transfer,
-            "output_transfer": output_transfer,
         },
         "fit": {
             "grid_nonzero": audit["grid_nonzero"],
@@ -396,10 +364,6 @@ class App(tk.Tk):
         self.table_var = tk.StringVar(value=str(TABLE_STEPS_DEFAULT))
         self.samples_var = tk.StringVar(value=str(SAMPLES_DEFAULT))
         self.accuracy_var = tk.StringVar(value=ACCURACY_DEFAULT)
-        self.output_var = tk.StringVar(value=OUTPUT_DEFAULT)
-        self._display_samples = str(SAMPLES_DEFAULT)
-        self._display_table = str(TABLE_STEPS_DEFAULT)
-        self._log_mode = False
         self.status_var = tk.StringVar(value="选好 LUT 文件后点「开始转换」")
         self.theme_var = tk.StringVar(value=theme_label)
 
@@ -653,21 +617,9 @@ class App(tk.Tk):
         )
         settings.columnconfigure(3, weight=0)
 
-        label(4, "输出")
-        self.output_box = ttk.Combobox(
-            settings,
-            textvariable=self.output_var,
-            values=list(OUTPUTS),
-            state="readonly",
-            width=18,
-            font=looktheme.FONT,
-        )
-        self.output_box.grid(row=4, column=1, columnspan=3, sticky="w", pady=3)
-        self.output_var.trace_add("write", self._on_output_change)
-
-        label(5, "保存到")
+        label(4, "保存到")
         out_row = ttk.Frame(settings)
-        out_row.grid(row=5, column=1, columnspan=3, sticky="ew", pady=3)
+        out_row.grid(row=4, column=1, columnspan=3, sticky="ew", pady=3)
         out_row.columnconfigure(0, weight=1)
         ttk.Entry(out_row, textvariable=self.out_var, font=looktheme.FONT).grid(
             row=0, column=0, sticky="ew"
@@ -866,33 +818,6 @@ class App(tk.Tk):
             self._current_cube = cube
             self._schedule_preview()
 
-    def _on_output_change(self, *_args: object) -> None:
-        """输出切到 S-Log3 时,采样数与最后修正自动抬高;切回普通显示时还原原值。"""
-        want_log = OUTPUTS.get(self.output_var.get(), "display") == "slog3"
-        if want_log and not self._log_mode:
-            self._display_samples = self.samples_var.get() or str(SAMPLES_DEFAULT)
-            self._display_table = self.table_var.get() or str(TABLE_STEPS_DEFAULT)
-            try:
-                samples = int(self._display_samples)
-            except ValueError:
-                samples = SAMPLES_DEFAULT
-            try:
-                table = int(self._display_table)
-            except ValueError:
-                table = TABLE_STEPS_DEFAULT
-            self.samples_var.set(str(max(samples, SLOG3_MIN_SAMPLES)))
-            self.table_var.set(str(max(table, SLOG3_MIN_TABLE_STEPS)))
-            self._log_mode = True
-            self.status_var.set(
-                f"S-Log3 输出:采样数已抬到 {SLOG3_MIN_SAMPLES}、"
-                f"最后修正 {SLOG3_MIN_TABLE_STEPS},暗部才压得住"
-            )
-        elif not want_log and self._log_mode:
-            self.samples_var.set(self._display_samples)
-            self.table_var.set(self._display_table)
-            self._log_mode = False
-            self.status_var.set("选好 LUT 文件后点「开始转换」")
-
     def _on_accuracy(self, _event: tk.Event[Any]) -> None:
         self.accuracy_note.configure(text=ACCURACY_NOTE.get(self.accuracy_var.get(), ""))
 
@@ -924,7 +849,6 @@ class App(tk.Tk):
             messagebox.showwarning("数字填错了", "采样数和最后修正要填数字。")
             return
 
-        output_transfer = OUTPUTS.get(self.output_var.get(), "display")
         out = Path(out_text)
         out.mkdir(parents=True, exist_ok=True)
         cubes = list(self._sources)
@@ -936,7 +860,7 @@ class App(tk.Tk):
         self._begin(len(cubes))
         worker = threading.Thread(
             target=self._work,
-            args=(cubes, names, out, steps, samples, table_steps, output_transfer),
+            args=(cubes, names, out, steps, samples, table_steps),
             daemon=True,
         )
         worker.start()
@@ -955,7 +879,6 @@ class App(tk.Tk):
         steps: int,
         samples: int,
         table_steps: int,
-        output_transfer: str = "display",
     ) -> None:
         done = 0
         failures = 0
@@ -976,7 +899,6 @@ class App(tk.Tk):
                     self._log,
                     samples=samples,
                     state=state,
-                    output_transfer=output_transfer,
                 )
                 self._queue.put(("row", (cube, name, info, True)))
                 self._queue.put(("camera", (cube, state)))

@@ -213,14 +213,11 @@ def cube_target(
     base: np.ndarray,
     cube: Any,
     transfer: str = "display",
-    output: str = "display",
 ) -> np.ndarray:
     """把 .cube 作用在相机基础输出上(0..255 sRGB 观感)。
 
     transfer="slog3" 时先把显示值换成 SLog3 码值再查表 ——
-    SLog3 型 LUT 的输入是 log 域,直接喂显示值会让画面又灰又淡。
-    output="slog3" 时把算完的画面再编码成 SLog3 码值 ——
-    相机出来的就是 log 画面,后期可以直接套 SLog3 的 LUT。
+    SLog3 型 LUT 的输入本来就是 log 域,直接喂显示值会让画面又灰又淡。
     """
     from r5lut import preview
     from r5lut import transfer as transfer_mod
@@ -228,21 +225,12 @@ def cube_target(
     flat = base.reshape(-1, 3) / 255.0
     out = np.empty_like(flat)
     use_log = transfer == transfer_mod.SLOG3
-    want_log = output == transfer_mod.SLOG3
     for index, (red, green, blue) in enumerate(flat):
         if use_log:
             red = transfer_mod.display_to_slog3(float(red))
             green = transfer_mod.display_to_slog3(float(green))
             blue = transfer_mod.display_to_slog3(float(blue))
-        sampled = preview.sample(cube, float(red), float(green), float(blue))
-        if want_log:
-            out[index] = (
-                transfer_mod.display_to_slog3(sampled[0]),
-                transfer_mod.display_to_slog3(sampled[1]),
-                transfer_mod.display_to_slog3(sampled[2]),
-            )
-        else:
-            out[index] = sampled
+        out[index] = preview.sample(cube, float(red), float(green), float(blue))
     return (np.clip(out, 0.0, 1.0) * 255.0).reshape(base.shape)
 
 
@@ -379,27 +367,6 @@ def _de00(pred: np.ndarray, target: np.ndarray) -> np.ndarray:
     return np.asarray(de2000(to_lab(np.clip(pred, 0, 255)), to_lab(np.clip(target, 0, 255))))
 
 
-def _decode_torch(values: Any, kind: str) -> Any:
-    """把 0..255 的 log 码值解码回 0..255 的显示值(torch 版,可反向传播)。"""
-    if kind != "slog3":
-        return values
-    from r5lut import transfer as transfer_mod
-
-    torch = __import__("torch")
-    table = transfer_mod.SLOG3_CURVE
-    codes = torch.tensor(
-        [point[1] * 255.0 for point in table], dtype=values.dtype, device=values.device
-    )
-    shows = torch.tensor(
-        [point[0] * 255.0 for point in table], dtype=values.dtype, device=values.device
-    )
-    position = torch.searchsorted(codes, values.contiguous()).clamp(1, len(table) - 1)
-    low = position - 1
-    span = (codes[position] - codes[low]).clamp_min(1e-6)
-    ratio = ((values - codes[low]) / span).clamp(0.0, 1.0)
-    return shows[low] + (shows[position] - shows[low]) * ratio
-
-
 def fit(
     assets: Path | str,
     target: np.ndarray,
@@ -413,7 +380,6 @@ def fit(
     perceptual: float = 0.0,
     stratified: bool = True,
     progress: Any = None,
-    decode: str = "",
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Adam/STE 拟合 → 量化 → 整数抛光;返回 (3,5,9,9) int 网格与审计。"""
     torch_module = __import__("torch")
@@ -443,11 +409,9 @@ def fit(
         optimizer.zero_grad(set_to_none=True)
         quantized = torch_module.round(values).clamp(-64, 63).detach() + (values - values.detach())
         out = model.response(want[None], quantized.reshape(1, *GRID_SHAPE))[0][0]
-        seen = _decode_torch(out, decode)
-        want_seen = _decode_torch(goal, decode)
-        rgb = ((seen - want_seen) ** 2).mean()
+        rgb = ((out - goal) ** 2).mean()
         if perceptual > 0.0:
-            de = _de00_torch(seen, want_seen)
+            de = _de00_torch(out, goal)
             rgb = rgb + perceptual * (2.55 * de**2).mean()
         smooth = (
             (quantized[:, 1:] - quantized[:, :-1]).abs().mean()
@@ -476,13 +440,10 @@ def fit(
     x_polish = torch.as_tensor(base[polish_rows], device=model.device, dtype=torch.float32)
     y_polish = torch.as_tensor(target[polish_rows], device=model.device, dtype=torch.float32)
 
-    y_polish_seen = _decode_torch(y_polish, decode)
-
     def _loss(candidate: Any) -> float:
         tensor = torch.as_tensor(candidate, device=model.device, dtype=torch.float32)
         out = model.response(x_polish[None], tensor.reshape(1, *GRID_SHAPE))[0][0]
-        seen = _decode_torch(out, decode)
-        return float(((seen - y_polish_seen) ** 2).mean().detach().cpu())
+        return float(((out - y_polish) ** 2).mean().detach().cpu())
 
     current = np.clip(np.rint(grid), -64, 63).astype(np.int16)
     best_loss = _loss(current)
@@ -490,7 +451,7 @@ def fit(
     for _ in range(4):
         values = torch.tensor(current, device=model.device, dtype=torch.float32, requires_grad=True)
         out = model.response(x_polish[None], values.reshape(1, *GRID_SHAPE))[0][0]
-        loss = ((_decode_torch(out, decode) - y_polish_seen) ** 2).mean()
+        loss = ((out - y_polish) ** 2).mean()
         gradient = torch.autograd.grad(loss, values)[0].detach().cpu().numpy()
         step_dir: Any = np.where(gradient > 0, -1, 1).astype(np.int16)
         trial = np.clip(current + step_dir, -64, 63).astype(np.int16)
@@ -500,24 +461,17 @@ def fit(
         current, best_loss = trial, trial_loss
     grid = current
 
-    best = model.render(front, grid)
-    best_seen = np.asarray(
-        _decode_torch(torch_module.as_tensor(best, device=model.device), decode).detach().cpu(),
-        dtype=np.float64,
-    )
-    target_seen = np.asarray(
-        _decode_torch(torch_module.as_tensor(target, device=model.device), decode).detach().cpu(),
-        dtype=np.float64,
-    )
-    best_loss = float(np.mean((best_seen - target_seen) ** 2))
+    best = np.asarray(model.render(front, grid), dtype=np.float64)
+    target_seen = np.asarray(target, dtype=np.float64)
+    best_loss = float(np.mean((best - target_seen) ** 2))
 
     audit = {
         "steps": steps,
         "samples": int(len(ids)),
         "device": model.device,
         "rgb_mse": best_loss,
-        "mae8": float(np.abs(best_seen - target_seen).mean()),
-        "de00": float(np.mean(_de00(best_seen, target_seen))),
+        "mae8": float(np.abs(best - target_seen).mean()),
+        "de00": float(np.mean(_de00(best, target_seen))),
         "grid_nonzero": int(np.count_nonzero(grid)),
         "grid_min": int(grid.min()),
         "grid_max": int(grid.max()),
@@ -569,17 +523,14 @@ class TableFit:
         target: Any,
         samples: int = 8192,
         seed: int = 20261110,
-        decode: str = "",
     ) -> None:
         torch = model.torch
         self.model = model
-        self.decode = decode
         wanted = np.asarray(target, dtype=np.float64).reshape(-1, 3)
         rng = np.random.default_rng(seed)
         self.ids = np.sort(rng.choice(len(wanted), min(samples, len(wanted)), replace=False))
         self.path = TablePath(model, base, self.ids)
         self.want = torch.as_tensor(wanted[self.ids], dtype=torch.float32, device=model.device)
-        self.want_seen = _decode_torch(self.want, decode)
 
     def _outputs(self, grid: Any) -> Any:
         return self.path.outputs(grid)
@@ -596,7 +547,7 @@ class TableFit:
             optimizer.zero_grad(set_to_none=True)
             quantized = torch.round(values).clamp(-64, 63).detach() + (values - values.detach())
             out = self._outputs(quantized)
-            loss = ((_decode_torch(out, self.decode) - self.want_seen) ** 2).mean()
+            loss = ((out - self.want) ** 2).mean()
             loss.backward()
             optimizer.step()
         candidate = np.clip(np.rint(values.detach().cpu().numpy()), -64, 63).astype(np.int16)
@@ -609,8 +560,7 @@ class TableFit:
                 best, device=self.model.device, dtype=torch.float32, requires_grad=True
             )
             out = self._outputs(tensor)
-            seen = _decode_torch(out, self.decode)
-            gradient = torch.autograd.grad(((seen - self.want_seen) ** 2).mean(), tensor)[0]
+            gradient = torch.autograd.grad(((out - self.want) ** 2).mean(), tensor)[0]
             direction = np.where(gradient.detach().cpu().numpy() > 0, -1, 1).astype(np.int16)
             trial = np.clip(best + direction, -64, 63).astype(np.int16)
             trial_loss = self.loss(trial)
@@ -625,8 +575,7 @@ class TableFit:
             out = self._outputs(
                 torch.as_tensor(np.asarray(grid), dtype=torch.float32, device=self.model.device)
             )
-            seen = _decode_torch(out, self.decode)
-            return float(((seen - self.want_seen) ** 2).mean().detach().cpu())
+            return float(((out - self.want) ** 2).mean().detach().cpu())
 
 
 def evaluate(

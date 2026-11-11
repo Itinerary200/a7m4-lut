@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "a7m4-lut"
-version = "1.2.11"
+version = "1.3.0"
 description = "把 .cube LUT 转成索尼 A7M4 机内创意外观(camera-look v2 JSON),也支持输出 S-Log3"
 readme = "README.md"
 requires-python = ">=3.10"
