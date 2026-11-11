@@ -19,18 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-注意 / Note
-
-本许可覆盖本仓库自有代码（src/、tools/、tests/、docs/、build/ 脚本等）。
-
-不覆盖以下内容：
-
-1. engine/ —— vendored 自 Hearts-Ace/sony-r5-colorlab，GNU AGPL-3.0，
-   见 engine/LICENSE.orig-agpl3.txt 与 engine/VENDORED-NOTES.md。
-2. vendor/m4/ —— vendored 自 Erlla/sony-a7m4-custom-firmware，遵循上游许可，
-   见 vendor/m4/PROVENANCE.md。
-3. models/、charts/、native16/ 等训练资产 —— 版权归索尼，不在本仓库分发。
-4. 第三方 LUT（.cube）与相机固件相关数据 —— 版权归各自作者。

@@ -193,7 +193,7 @@ docs/           格式规范、使用说明、训练方法
 
 ## 资产与许可
 
-- 本仓库**代码**：MIT，见 [LICENSE](LICENSE)。
+- 本仓库**自有代码**：MIT，见 [LICENSE](LICENSE)；范围说明见 [LICENSE-SCOPE.md](LICENSE-SCOPE.md)。
 - `engine/`（A7R V 侧训练引擎）：[Hearts-Ace/sony-r5-colorlab](https://github.com/Hearts-Ace/sony-r5-colorlab)
   的 vendored 副本，**AGPL-3.0**，见 [engine/VENDORED-NOTES.md](engine/VENDORED-NOTES.md)。
 - `vendor/m4/`：来自 [Erlla/sony-a7m4-custom-firmware](https://github.com/Erlla/sony-a7m4-custom-firmware)，
