@@ -29,6 +29,18 @@ ACCURACY: dict[str, int] = {
 }
 ACCURACY_DEFAULT = "标准(约 20 秒)"
 
+# 保存结构:相机卡结构可以直接拷,按原文件夹分方便自己找
+LAYOUTS: dict[str, str] = {
+    "相机卡(直接拷到 SD)": "camera",
+    "跟原文件夹一样": "mirror",
+}
+LAYOUT_DEFAULT = "相机卡(直接拷到 SD)"
+CARD_PATH = "PRIVATE\\M4ROOT\\GENERAL\\LUT"
+LAYOUT_HINTS: dict[str, str] = {
+    "camera": "成片放在 PRIVATE\\M4ROOT\\GENERAL\\LUT,整个 PRIVATE 拷到卡根目录",
+    "mirror": "按你选的文件夹分好子目录,方便对照,不会生成 PRIVATE",
+}
+
 ACCURACY_NOTE = {
     "快速(约 10 秒)": "最快,颜色靠近但不追细节",
     "标准(约 20 秒)": "日常够用,推荐",
@@ -66,8 +78,13 @@ def convert_one(
     samples: int = 8192,
     state: dict[str, Any] | None = None,
     input_transfer: str = "auto",
+    layout: str = "camera",
 ) -> dict[str, Any]:
-    """单张转换(界面与命令行共用)。state 用来把模型与网格交回界面做预览。"""
+    """单张转换(界面与命令行共用)。state 用来把模型与网格交回界面做预览。
+
+    layout="camera" 写在 <out>/PRIVATE/M4ROOT/GENERAL/LUT(直接拷卡);
+    layout="mirror" 直接写在 <out> 下(调用方已经把子目录拼进来)。
+    """
     import hashlib
 
     import numpy as np
@@ -268,7 +285,10 @@ def convert_one(
         live_grid=table,
         provenance=provenance,
     )
-    info = m4json.write(out / "PRIVATE" / "M4ROOT" / "GENERAL" / "LUT" / f"{name}.json", value)
+    target = out
+    if layout != "mirror":
+        target = out / "PRIVATE" / "M4ROOT" / "GENERAL" / "LUT"
+    info = m4json.write(target / f"{name}.json", value)
     info["fit"] = {"de00": de00, "mae8": mae8, "grid_nonzero": audit["grid_nonzero"]}
     info["sd_path"] = m4json.sd_path(f"{name}.json")
     return info
@@ -431,7 +451,7 @@ class App(tk.Tk):
         self._panel_width = max(MIN_PANEL, min(720, self._panel_width))
         screen_w, screen_h, _scale = _logical_screen(self)
         width = min(1180, max(1040, screen_w - 40))
-        height = min(940, max(820, screen_h - 40))
+        height = min(1000, max(880, screen_h - 40))
         left = max(0, (screen_w - width) // 2)
         top = max(0, (screen_h - height) // 3)
         self._place_sash()
@@ -440,7 +460,7 @@ class App(tk.Tk):
         self._window_width = width
         self._panel_width = max(MIN_PANEL, min(self._panel_width, width - MIN_LEFT - 40))
         self.geometry(f"{width}x{height}+{left}+{top}")
-        self.minsize(1040, 820)
+        self.minsize(1040, 880)
         self.configure(background=looktheme.FALLBACK["background"])
 
         self.theme = looktheme.apply(self, theme_label)
@@ -463,6 +483,8 @@ class App(tk.Tk):
         self.table_var = tk.StringVar(value=str(TABLE_STEPS_DEFAULT))
         self.samples_var = tk.StringVar(value=str(SAMPLES_DEFAULT))
         self.accuracy_var = tk.StringVar(value=ACCURACY_DEFAULT)
+        self.layout_var = tk.StringVar(value=LAYOUT_DEFAULT)
+        self._roots: list[Path] = []
         self.status_var = tk.StringVar(value="选好 LUT 文件后点「开始转换」")
         self.theme_var = tk.StringVar(value=theme_label)
 
@@ -725,6 +747,21 @@ class App(tk.Tk):
         )
         self.theme.button(out_row, "浏览…", self._pick_out).grid(row=0, column=1, padx=(6, 0))
 
+        label(5, "保存结构")
+        self.layout_box = ttk.Combobox(
+            settings,
+            textvariable=self.layout_var,
+            values=list(LAYOUTS),
+            state="readonly",
+            width=22,
+            font=looktheme.FONT,
+        )
+        self.layout_box.grid(row=5, column=1, columnspan=3, sticky="w", pady=(3, 0))
+        self.layout_box.bind("<<ComboboxSelected>>", self._on_layout)
+        self.layout_hint = ttk.Label(
+            settings, text=LAYOUT_HINTS["camera"], style="Hint.TLabel", wraplength=420
+        )
+        self.layout_hint.grid(row=6, column=1, columnspan=3, sticky="w", pady=(0, 4))
         actions = ttk.Frame(parent)
         actions.pack(fill="x", pady=(0, 6))
         self.start_btn = self.theme.button(actions, "开始转换", self._run, kind="primary")
@@ -873,6 +910,7 @@ class App(tk.Tk):
     def _pick_folder(self) -> None:
         folder = filedialog.askdirectory(title="选择放 LUT 的文件夹")
         if folder:
+            self._roots.append(Path(folder))
             self._add_sources(sorted(Path(folder).rglob("*.cube")))
 
     def _pick_zip(self) -> None:
@@ -884,6 +922,7 @@ class App(tk.Tk):
         target = Path(self._tmp_dir()) / Path(archive).stem
         with zipfile.ZipFile(archive) as bundle:
             bundle.extractall(target)
+        self._roots.append(target)
         self._add_sources(sorted(target.rglob("*.cube")))
 
     def _tmp_dir(self) -> Path:
@@ -895,6 +934,7 @@ class App(tk.Tk):
 
     def _clear_sources(self) -> None:
         self._sources.clear()
+        self._roots.clear()
         self.source_list.delete(0, "end")
         self._current_cube = None
         self._forget_camera()
@@ -927,6 +967,24 @@ class App(tk.Tk):
 
     def _on_accuracy(self, _event: tk.Event[Any]) -> None:
         self.accuracy_note.configure(text=ACCURACY_NOTE.get(self.accuracy_var.get(), ""))
+
+    def _on_layout(self, _event: tk.Event[Any] | None = None) -> None:
+        self.layout_hint.configure(text=LAYOUT_HINTS[self._layout()])
+
+    def _layout(self) -> str:
+        return LAYOUTS.get(self.layout_var.get(), "camera")
+
+    def _relative_dir(self, cube: Path) -> Path:
+        """按导入时的根目录算这个文件所在的子目录(没有根就放平)。"""
+        chosen: tuple[int, Path] | None = None
+        for root in self._roots:
+            try:
+                rel = cube.parent.relative_to(root)
+            except ValueError:
+                continue
+            if chosen is None or len(root.parts) > chosen[0]:
+                chosen = (len(root.parts), rel)
+        return chosen[1] if chosen is not None else Path()
 
     def _on_theme(self, _event: tk.Event[Any]) -> None:
         label = self.theme_var.get()
@@ -964,10 +1022,12 @@ class App(tk.Tk):
             if len(cubes) == 1
             else [_safe_name(cube.stem) for cube in cubes]
         )
+        folders = [self._relative_dir(cube) for cube in cubes]
+        layout = self._layout()
         self._begin(len(cubes))
         worker = threading.Thread(
             target=self._work,
-            args=(cubes, names, out, steps, samples, table_steps),
+            args=(cubes, names, out, folders, layout, steps, samples, table_steps),
             daemon=True,
         )
         worker.start()
@@ -983,6 +1043,8 @@ class App(tk.Tk):
         cubes: list[Path],
         names: list[str],
         out: Path,
+        folders: list[Path],
+        layout: str,
         steps: int,
         samples: int,
         table_steps: int,
@@ -994,11 +1056,12 @@ class App(tk.Tk):
             name = names[index]
             self._queue.put(("status", f"正在转换 {index + 1}/{len(cubes)}:{cube.name}"))
             state: dict[str, Any] = {}
+            target = out / folders[index] if layout == "mirror" else out
             try:
                 info = convert_one(
                     cube,
                     assets,
-                    out,
+                    target,
                     name,
                     None,
                     steps,
@@ -1006,6 +1069,7 @@ class App(tk.Tk):
                     self._log,
                     samples=samples,
                     state=state,
+                    layout=layout,
                 )
                 self._queue.put(("row", (cube, name, info, True)))
                 self._queue.put(("camera", (cube, state)))
@@ -1077,7 +1141,8 @@ class App(tk.Tk):
             if last:
                 self.status_var.set(self.status_var.get() + f" · {last}")
         else:
-            self.status_var.set(f"完成:共 {total} 个,已写进 {self.out_var.get().strip()}")
+            where = CARD_PATH if self._layout() == "camera" else "原文件夹结构"
+            self.status_var.set(f"完成 {total} 个 → {where}")
         self.progress.configure(value=total)
         self._schedule_preview()
 
@@ -1089,7 +1154,11 @@ class App(tk.Tk):
 
     def _lut_dir(self) -> Path | None:
         base = self._out_dir()
-        return base / "PRIVATE" / "M4ROOT" / "GENERAL" / "LUT" if base else None
+        if base is None:
+            return None
+        if self._layout() == "mirror":
+            return base
+        return base / "PRIVATE" / "M4ROOT" / "GENERAL" / "LUT"
 
     def _open_out(self) -> None:
         base = self._out_dir()

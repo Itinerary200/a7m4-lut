@@ -59,6 +59,12 @@ def build_parser() -> argparse.ArgumentParser:
     batch4.add_argument("--limit", type=int, default=0)
     batch4.add_argument("--resume", action="store_true", help="跳过已存在的 JSON")
     batch4.add_argument("--table-steps", type=int, default=150, dest="table_steps")
+    batch4.add_argument(
+        "--layout",
+        default="camera",
+        choices=["camera", "mirror"],
+        help="camera=PRIVATE\\M4ROOT\\GENERAL\\LUT;mirror=跟来源目录一样",
+    )
 
     m4 = subs.add_parser("m4", help="A7M4:cube → camera-look v2 JSON(冻结 M4 模型上拟合 405 网格)")
     m4.add_argument("--cube", required=True, help="目标 .cube")
@@ -73,6 +79,12 @@ def build_parser() -> argparse.ArgumentParser:
     m4.add_argument("--steps", type=int, default=1000)
     m4.add_argument("--samples", type=int, default=8192)
     m4.add_argument("--native16", default=None, help="chart_native 输出的 .npy(相机原生链,推荐)")
+    m4.add_argument(
+        "--layout",
+        default="camera",
+        choices=["camera", "mirror"],
+        help="camera=PRIVATE\\M4ROOT\\GENERAL\\LUT;mirror=直接放在 -o 目录",
+    )
     m4.add_argument(
         "--transfer",
         default="auto",
@@ -166,7 +178,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "m4-batch":
         from . import m4fit, m4gui
 
-        cubes = sorted(Path(args.lut_dir).glob("*.cube"))
+        cubes = sorted(Path(args.lut_dir).rglob("*.cube"))
         if args.limit:
             cubes = cubes[: args.limit]
         if not cubes:
@@ -177,8 +189,15 @@ def main(argv: list[str] | None = None) -> int:
         batch_native = getattr(args, "native16", None)
         print(f"资产: {batch_assets} | 待转换 {len(cubes)} 个")
         rows = []
+        layout = str(getattr(args, "layout", "camera"))
         for index, cube in enumerate(cubes, 1):
-            batch_out = out_root / f"{index:02d}"
+            if layout == "mirror":
+                try:
+                    batch_out = out_root / cube.parent.relative_to(Path(args.lut_dir))
+                except ValueError:
+                    batch_out = out_root
+            else:
+                batch_out = out_root / f"{index:02d}"
             try:
                 info = m4gui.convert_one(
                     cube,
@@ -189,6 +208,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.steps,
                     args.table_steps,
                     print,
+                    layout=layout,
                 )
                 rows.append(
                     {
@@ -262,6 +282,7 @@ def main(argv: list[str] | None = None) -> int:
             lambda message: print(message, file=sys.stderr),
             samples=args.samples,
             input_transfer=args.transfer,
+            layout=args.layout,
         )
         print(
             json.dumps(
